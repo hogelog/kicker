@@ -1,0 +1,309 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "fileutils"
+require "etc"
+require "rbconfig"
+require "date"
+require "yaml"
+
+HOME = Dir.home
+CONFIG_FILE = File.join(ENV.fetch("XDG_CONFIG_HOME", "#{HOME}/.config"), "kicker", "config.yml")
+
+STATE_DIR = File.join(ENV.fetch("XDG_STATE_HOME", "#{HOME}/.local/state"), "kicker")
+PID_DIR = File.join(STATE_DIR, "pids")
+LOG_DIR = File.join(STATE_DIR, "logs")
+
+def pid_file(name) = File.join(PID_DIR, "#{name}.pid")
+def log_file(name) = File.join(LOG_DIR, "#{name}.log")
+
+# YAML に Ruby の Range は書けないので "9..19" のような文字列で受けて変換する
+def parse_range(value)
+  return value unless value.is_a?(String)
+
+  m = value.match(/\A(\d+)(\.\.\.?)(\d+)\z/) or abort "kicker: invalid range in #{CONFIG_FILE}: #{value}"
+  Range.new(m[1].to_i, m[3].to_i, m[2] == "...")
+end
+
+def load_apps
+  config = YAML.safe_load_file(CONFIG_FILE, symbolize_names: true) || {}
+  config.to_h do |name, app|
+    app = app.merge(dir: File.expand_path(app.fetch(:dir)))
+    app[:during] = app[:during].transform_values { parse_range(_1) } if app[:during]
+    [name.to_s, app]
+  end.freeze
+rescue Errno::ENOENT
+  abort "kicker: config not found: #{CONFIG_FILE}"
+end
+
+def apps = @apps ||= load_apps
+
+def app!(name)
+  apps[name] or abort "kicker: unknown app: #{name} (available: #{apps.keys.join(", ")})"
+end
+
+def resolve(names)
+  return apps.keys if names.empty? || names == ["all"]
+
+  names.each { app!(_1) }
+  names
+end
+
+def read_pid(name)
+  pid = File.read(pid_file(name)).to_i
+  pid.positive? ? pid : nil
+rescue Errno::ENOENT
+  nil
+end
+
+def alive?(pid)
+  Process.kill(0, pid)
+  true
+rescue Errno::ESRCH
+  false
+rescue Errno::EPERM
+  true
+end
+
+# pid file は生き残ったまま中身のプロセスが死んでいることがあるので、
+# 生存確認に通らなければ即座に掃除する。
+def running_pid(name)
+  pid = read_pid(name)
+  return nil unless pid
+
+  return pid if alive?(pid)
+
+  FileUtils.rm_f(pid_file(name))
+  nil
+end
+
+def start(name)
+  app = app!(name)
+  if (pid = running_pid(name))
+    puts ["already running: #{name} (pid #{pid})", app[:url]].compact.join(" ")
+    return
+  end
+
+  FileUtils.mkdir_p([PID_DIR, LOG_DIR])
+  log = File.open(log_file(name), "a")
+  log.sync = true
+  log.puts "==== kicker start #{name}: #{describe(app)} (#{Time.now}) ===="
+
+  # every 付きの app は kicker 自身を繰り返し役として常駐させ、pid・ログ・停止の扱いを常駐 app と揃える
+  argv = app[:every] ? [RbConfig.ruby, File.realpath(__FILE__), "__every", name] : [app[:cmd]]
+  # 子プロセス (mise が起動するサーバ群) をまとめて停められるよう、
+  # 独立したプロセスグループのリーダーとして起動する。
+  pid = Process.spawn(
+    *argv,
+    chdir: app[:dir],
+    out: log,
+    err: log,
+    in: File::NULL,
+    pgroup: true,
+  )
+  log.close
+  Process.detach(pid)
+  File.write(pid_file(name), pid)
+  puts ["started: #{name} (pid #{pid})", app[:url]].compact.join(" ")
+end
+
+def stop(name)
+  pid = running_pid(name)
+  unless pid
+    puts "not running: #{name}"
+    return
+  end
+
+  signal(pid, "TERM")
+  50.times do
+    break unless alive?(pid)
+
+    sleep 0.1
+  end
+  if alive?(pid)
+    signal(pid, "KILL")
+    sleep 0.2
+  end
+  FileUtils.rm_f(pid_file(name))
+  puts "stopped: #{name} (pid #{pid})"
+end
+
+def every(name)
+  app = app!(name)
+  $stdout.sync = true
+  at = next_run(app, Time.now)
+  loop do
+    sleep_until(at)
+    # スリープ復帰などで予定を大きく過ぎていると時間帯の外にいることがある
+    unless within?(app, Time.now)
+      at = next_run(app, Time.now)
+      next
+    end
+
+    puts "==== kicker run #{name} (#{Time.now}) ===="
+    puts "==== kicker run #{name} failed: #{$?} ====" unless system(app[:cmd])
+    # 実行時間の分だけ予定がずれていかないよう、終了時刻ではなく予定時刻から数える
+    at = next_run(app, at + app[:every])
+    puts "==== kicker next #{name} (#{at}) ====" if at > Time.now + app[:every]
+  end
+end
+
+# 分単位で判定し、秒のずれで 19:00 ちょうどの回が範囲外にならないようにする
+def within?(app, time)
+  during = app[:during] or return true
+  hour = time.hour + Rational(time.min, 60)
+  (!during[:wday] || during[:wday].include?(time.wday)) && (!during[:hour] || during[:hour].cover?(hour))
+end
+
+def next_run(app, from)
+  return from if within?(app, from)
+
+  start = app.dig(:during, :hour)&.begin || 0
+  (0..7).each do |i|
+    day = from.to_date + i
+    time = Time.new(day.year, day.month, day.day, start)
+    return time if time > from && within?(app, time)
+  end
+  abort "kicker: during never matches: #{app[:during]}"
+end
+
+# PC のスリープ中は sleep の時計が止まるため、細切れに起きて実時刻で判定する
+def sleep_until(time)
+  while (rest = time - Time.now).positive?
+    sleep [rest, 60].min
+  end
+end
+
+def duration(sec)
+  return "#{sec / 3600}h" if (sec % 3600).zero?
+  return "#{sec / 60}m" if (sec % 60).zero?
+
+  "#{sec}s"
+end
+
+def schedule(app)
+  parts = ["every #{duration(app[:every])}"]
+  if (during = app[:during])
+    wday = during[:wday]
+    parts << (wday.is_a?(Range) ? "#{Date::ABBR_DAYNAMES[wday.begin]}-#{Date::ABBR_DAYNAMES[wday.end]}" : wday.map { Date::ABBR_DAYNAMES[_1] }.join(",")) if wday
+    hour = during[:hour]
+    parts << "#{hour.begin}:00-#{hour.end}:00" if hour
+  end
+  parts.join(" ")
+end
+
+def describe(app) = app[:every] ? "#{app[:cmd]} (#{schedule(app)})" : app[:cmd]
+
+def signal(pid, sig)
+  Process.kill(sig, -pid) # プロセスグループ全体
+rescue Errno::ESRCH
+  begin
+    Process.kill(sig, pid)
+  rescue Errno::ESRCH
+    nil
+  end
+end
+
+def status(names)
+  rows = names.map do |name|
+    pid = running_pid(name)
+    state = pid ? "running (pid #{pid})" : "stopped"
+    app = apps[name]
+    [name, state, pid ? app[:url] : nil, app[:every] && schedule(app)]
+  end
+  print_table(rows)
+end
+
+def list
+  print_table(apps.map { |name, app| [name, describe(app), app[:url], "(#{app[:dir]})"] })
+end
+
+def print_table(rows)
+  widths = rows.map { |row| row.map { _1.to_s.length } }
+                .transpose
+                .map(&:max)
+  rows.each do |row|
+    line = row.each_with_index.map { |cell, i| cell.to_s.ljust(widths[i]) }.join("  ")
+    puts line.rstrip
+  end
+end
+
+PREFIX_COLORS = [36, 35, 32, 33, 34, 31].freeze # cyan magenta green yellow blue red
+
+def color(text, code)
+  return text unless $stdout.tty? && !ENV.key?("NO_COLOR")
+
+  "\e[#{code}m#{text}\e[0m"
+end
+
+def log(names, follow:, lines:)
+  targets = names.select { File.exist?(log_file(_1)) }
+  abort "kicker: no log for: #{names.join(", ")}" if targets.empty?
+
+  width = targets.map(&:length).max
+  out = Mutex.new
+  # 行ごとの時刻を持っていないので、複数 app のログを時系列にマージはできない。
+  # follow では届いた順、それ以外は app 順に出す。
+  readers = targets.map.with_index do |name, i|
+    prefix = color(name.ljust(width), PREFIX_COLORS[i % PREFIX_COLORS.size]) + color(": ", 90)
+    lambda do
+      IO.popen(["tail", *(follow ? ["-f"] : []), "-n", lines.to_s, log_file(name)]) do |io|
+        io.each_line { |line| out.synchronize { puts "#{prefix}#{line.chomp}" } }
+      end
+    end
+  end
+
+  if follow
+    readers.map { Thread.new(&_1) }.each(&:join)
+  else
+    readers.each(&:call)
+  end
+rescue Interrupt
+  nil
+end
+
+def usage
+  <<~USAGE
+    usage: kicker <command> [app...]
+
+    commands:
+      start [app...]       起動する (app 省略 or all で全部)
+      stop [app...]        停止する
+      restart [app...]     停止して起動する
+      status [app...]      稼働状況を表示する
+      list                 登録されている app を表示する
+      log [app...] [-f] [-n N]  ログを表示する
+
+    config: #{CONFIG_FILE}
+  USAGE
+end
+
+command = ARGV.shift
+args = ARGV
+
+case command
+when "start" then resolve(args).each { start(_1) }
+when "stop" then resolve(args).each { stop(_1) }
+when "restart"
+  resolve(args).each do |name|
+    stop(name)
+    start(name)
+  end
+when "status" then status(resolve(args))
+when "list" then list
+when "__every" then every(args.fetch(0))
+when "log", "logs"
+  follow = false
+  lines = 50
+  names = []
+  until args.empty?
+    case (arg = args.shift)
+    when "-f", "--follow" then follow = true
+    when "-n", "--lines" then lines = args.shift.to_i
+    else names << arg
+    end
+  end
+  log(resolve(names), follow:, lines:)
+when nil, "-h", "--help", "help" then puts usage
+else abort "kicker: unknown command: #{command}\n\n#{usage}"
+end
