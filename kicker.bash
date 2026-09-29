@@ -4,7 +4,7 @@ _kicker() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="start stop restart status list log help"
+  commands="start stop restart status list log launchd help"
 
   if [[ $COMP_CWORD -eq 1 ]]; then
     COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -22,6 +22,9 @@ _kicker() {
       fi
       apps="all -f -n $(kicker list 2>/dev/null | awk '{print $1}')"
       COMPREPLY=($(compgen -W "$apps" -- "$cur"))
+      ;;
+    launchd)
+      [[ $COMP_CWORD -eq 2 ]] && COMPREPLY=($(compgen -W "install uninstall" -- "$cur"))
       ;;
   esac
 }

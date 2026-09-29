@@ -70,3 +70,14 @@ $ ln -s "$PWD/kicker.bash" "$(brew --prefix)/etc/bash_completion.d/kicker"
 ```
 
 補完は app 一覧を `kicker list` から取るので、`kicker` が PATH 上にあること。
+
+### ログイン時に起動する (macOS)
+
+```console
+$ kicker launchd install      # ~/Library/LaunchAgents に登録し、その場で kicker start も走る
+$ kicker launchd uninstall
+```
+
+ログイン時に `kicker start` を 1 回走らせるだけで、落ちた app の再起動はしない。
+launchd には install した時点の `PATH` を渡すので、`PATH` や kicker の置き場所を変えたら install し直す。
+launchd から起動したときの出力は `~/.local/state/kicker/logs/launchd.log` に出る。

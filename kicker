@@ -262,6 +262,61 @@ rescue Interrupt
   nil
 end
 
+LAUNCHD_LABEL = "io.github.hogelog.kicker"
+LAUNCHD_PLIST = File.join(HOME, "Library", "LaunchAgents", "#{LAUNCHD_LABEL}.plist")
+
+def launchd_domain = "gui/#{Process.uid}"
+
+def plist_string(value) = "<string>#{value.encode(xml: :text)}</string>"
+
+# launchd の PATH は /usr/bin:/bin 程度しかなく mise などが見つからないので、install した時点の PATH を焼き込む。
+# kicker start はすぐ終わるが、app は別プロセスグループで起動しているので launchd の後始末には巻き込まれない。
+# AbandonProcessGroup はその前提が崩れたときの保険。
+def launchd_plist
+  <<~PLIST
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key>
+      #{plist_string(LAUNCHD_LABEL)}
+      <key>ProgramArguments</key>
+      <array>
+        #{plist_string(File.realpath(__FILE__))}
+        #{plist_string("start")}
+      </array>
+      <key>EnvironmentVariables</key>
+      <dict>
+        <key>PATH</key>
+        #{plist_string(ENV.fetch("PATH"))}
+      </dict>
+      <key>RunAtLoad</key>
+      <true/>
+      <key>AbandonProcessGroup</key>
+      <true/>
+      <key>StandardOutPath</key>
+      #{plist_string(log_file("launchd"))}
+      <key>StandardErrorPath</key>
+      #{plist_string(log_file("launchd"))}
+    </dict>
+    </plist>
+  PLIST
+end
+
+def launchd_install
+  FileUtils.mkdir_p([File.dirname(LAUNCHD_PLIST), LOG_DIR])
+  system("launchctl", "bootout", "#{launchd_domain}/#{LAUNCHD_LABEL}", err: File::NULL)
+  File.write(LAUNCHD_PLIST, launchd_plist)
+  system("launchctl", "bootstrap", launchd_domain, LAUNCHD_PLIST) or abort "kicker: launchctl bootstrap failed"
+  puts "installed: #{LAUNCHD_PLIST}"
+end
+
+def launchd_uninstall
+  system("launchctl", "bootout", "#{launchd_domain}/#{LAUNCHD_LABEL}", err: File::NULL)
+  FileUtils.rm_f(LAUNCHD_PLIST)
+  puts "uninstalled: #{LAUNCHD_PLIST}"
+end
+
 def usage
   <<~USAGE
     usage: kicker <command> [app...]
@@ -273,6 +328,8 @@ def usage
       status [app...]      稼働状況を表示する
       list                 登録されている app を表示する
       log [app...] [-f] [-n N]  ログを表示する
+      launchd install      ログイン時に kicker start する LaunchAgent を登録する
+      launchd uninstall    LaunchAgent を外す
 
     config: #{CONFIG_FILE}
   USAGE
@@ -304,6 +361,12 @@ when "log", "logs"
     end
   end
   log(resolve(names), follow:, lines:)
+when "launchd"
+  case args.first
+  when "install" then launchd_install
+  when "uninstall" then launchd_uninstall
+  else abort "kicker: usage: kicker launchd install|uninstall"
+  end
 when nil, "-h", "--help", "help" then puts usage
 else abort "kicker: unknown command: #{command}\n\n#{usage}"
 end
