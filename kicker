@@ -17,7 +17,6 @@ LOG_DIR = File.join(STATE_DIR, "logs")
 def pid_file(name) = File.join(PID_DIR, "#{name}.pid")
 def log_file(name) = File.join(LOG_DIR, "#{name}.log")
 
-# YAML に Ruby の Range は書けないので "9..19" のような文字列で受けて変換する
 def parse_range(value)
   return value unless value.is_a?(String)
 
@@ -65,8 +64,6 @@ rescue Errno::EPERM
   true
 end
 
-# pid file は生き残ったまま中身のプロセスが死んでいることがあるので、
-# 生存確認に通らなければ即座に掃除する。
 def running_pid(name)
   pid = read_pid(name)
   return nil unless pid
@@ -89,10 +86,7 @@ def start(name)
   log.sync = true
   log.puts "==== kicker start #{name}: #{describe(app)} (#{Time.now}) ===="
 
-  # every 付きの app は kicker 自身を繰り返し役として常駐させ、pid・ログ・停止の扱いを常駐 app と揃える
   argv = app[:every] ? [RbConfig.ruby, File.realpath(__FILE__), "__every", name] : [app[:cmd]]
-  # 子プロセス (mise が起動するサーバ群) をまとめて停められるよう、
-  # 独立したプロセスグループのリーダーとして起動する。
   pid = Process.spawn(
     *argv,
     chdir: app[:dir],
@@ -134,7 +128,6 @@ def every(name)
   at = next_run(app, Time.now)
   loop do
     sleep_until(at)
-    # スリープ復帰などで予定を大きく過ぎていると時間帯の外にいることがある
     unless within?(app, Time.now)
       at = next_run(app, Time.now)
       next
@@ -142,13 +135,12 @@ def every(name)
 
     puts "==== kicker run #{name} (#{Time.now}) ===="
     puts "==== kicker run #{name} failed: #{$?} ====" unless system(app[:cmd])
-    # 実行時間の分だけ予定がずれていかないよう、終了時刻ではなく予定時刻から数える
     at = next_run(app, at + app[:every])
     puts "==== kicker next #{name} (#{at}) ====" if at > Time.now + app[:every]
   end
 end
 
-# 分単位で判定し、秒のずれで 19:00 ちょうどの回が範囲外にならないようにする
+# Compare at minute granularity so a run due at exactly 19:00 is not excluded by a few seconds
 def within?(app, time)
   during = app[:during] or return true
   hour = time.hour + Rational(time.min, 60)
@@ -167,7 +159,7 @@ def next_run(app, from)
   abort "kicker: during never matches: #{app[:during]}"
 end
 
-# PC のスリープ中は sleep の時計が止まるため、細切れに起きて実時刻で判定する
+# sleep's clock stops while the machine sleeps, so wake up in short steps and check the wall clock
 def sleep_until(time)
   while (rest = time - Time.now).positive?
     sleep [rest, 60].min
@@ -195,7 +187,7 @@ end
 def describe(app) = app[:every] ? "#{app[:cmd]} (#{schedule(app)})" : app[:cmd]
 
 def signal(pid, sig)
-  Process.kill(sig, -pid) # プロセスグループ全体
+  Process.kill(sig, -pid)
 rescue Errno::ESRCH
   begin
     Process.kill(sig, pid)
@@ -242,8 +234,6 @@ def log(names, follow:, lines:)
 
   width = targets.map(&:length).max
   out = Mutex.new
-  # 行ごとの時刻を持っていないので、複数 app のログを時系列にマージはできない。
-  # follow では届いた順、それ以外は app 順に出す。
   readers = targets.map.with_index do |name, i|
     prefix = color(name.ljust(width), PREFIX_COLORS[i % PREFIX_COLORS.size]) + color(": ", 90)
     lambda do
@@ -269,9 +259,6 @@ def launchd_domain = "gui/#{Process.uid}"
 
 def plist_string(value) = "<string>#{value.encode(xml: :text)}</string>"
 
-# launchd の PATH は /usr/bin:/bin 程度しかなく mise などが見つからないので、install した時点の PATH を焼き込む。
-# kicker start はすぐ終わるが、app は別プロセスグループで起動しているので launchd の後始末には巻き込まれない。
-# AbandonProcessGroup はその前提が崩れたときの保険。
 def launchd_plist
   <<~PLIST
     <?xml version="1.0" encoding="UTF-8"?>
@@ -322,14 +309,14 @@ def usage
     usage: kicker <command> [app...]
 
     commands:
-      start [app...]       起動する (app 省略 or all で全部)
-      stop [app...]        停止する
-      restart [app...]     停止して起動する
-      status [app...]      稼働状況を表示する
-      list                 登録されている app を表示する
-      log [app...] [-f] [-n N]  ログを表示する
-      launchd install      ログイン時に kicker start する LaunchAgent を登録する
-      launchd uninstall    LaunchAgent を外す
+      start [app...]       start apps (all apps if omitted or all)
+      stop [app...]        stop apps
+      restart [app...]     stop and start apps
+      status [app...]      show whether apps are running
+      list                 list configured apps
+      log [app...] [-f] [-n N]  show logs
+      launchd install      register a LaunchAgent that runs kicker start at login
+      launchd uninstall    remove the LaunchAgent
 
     config: #{CONFIG_FILE}
   USAGE
