@@ -1,83 +1,50 @@
 # kicker
 
-A tiny launcher for local dev servers and periodic commands. Apps are defined in
-`~/.config/kicker/config.yml` (or `$XDG_CONFIG_HOME/kicker/config.yml`).
+A tiny launcher for local dev servers and periodic commands.
+
+## Config
+
+`~/.config/kicker/config.yml`:
 
 ```yaml
 web:
   dir: ~/src/myapp
   cmd: bin/dev
-  url: http://localhost:3000
-```
+  url: http://localhost:3000   # optional
 
-`dir` and `cmd` are required. `url` is optional and is shown by `start` / `status` / `list`.
-
-An app with `every` (in seconds) is not kept running; instead `cmd` is run repeatedly, `every` seconds apart.
-`start` / `stop` / `status` / `log` work the same as for long-running apps.
-
-`during` restricts runs to certain days of the week (`wday`, 0 is Sunday) and hours (`hour`).
-`hour: 9..19` means from 9:00 up to and including 19:00; `9...19` excludes 19:00.
-`wday` can also be a list such as `[1, 3, 5]`.
-Outside the window, kicker waits until the window opens, so on Monday the first run happens at exactly 9:00.
-
-```yaml
 report:
   dir: ~/src/myapp
   cmd: bin/report
-  every: 1800
-  during:
-    wday: 1..5
-    hour: 9..19
+  every: 1800                  # run every 30 minutes instead of keeping it running
+  during:                      # optional
+    wday: 1..5                 # Mon-Fri (0 is Sunday); a list like [1, 3, 5] also works
+    hour: 9..19                # 9:00-19:00; 9...19 excludes 19:00
 ```
-
-The config is read when an app starts, so run `kicker restart <app>` after editing it.
 
 ## Usage
 
 ```console
-$ kicker start                # start all apps (kicker start web for just one)
-$ kicker status
-$ kicker log web -f
-$ kicker restart web
-$ kicker stop
+$ kicker start [app...]       # all apps if omitted
+$ kicker stop [app...]
+$ kicker restart [app...]
+$ kicker status [app...]
 $ kicker list
+$ kicker log [app...] [-f] [-n N]
 ```
 
-Omitting app names, or passing `all`, targets every app.
-
-`log` prefixes each line with the app name (`-f` to follow, `-n N` for the number of lines).
-
-```console
-$ kicker log -n 2
-web   : Completed 200 OK in 38ms
-worker: [ActiveJob] Performed ExampleJob
-```
-
-PID files live in `~/.local/state/kicker/pids/<app>.pid` and logs in `~/.local/state/kicker/logs/<app>.log`
-(under `$XDG_STATE_HOME` if set).
+State lives in `~/.local/state/kicker/`.
 
 ## Install
 
 ```console
 $ ln -s "$PWD/kicker" ~/.local/bin/kicker
-$ echo 'source '"$PWD"'/kicker.bash' >> ~/.bashrc
+$ echo 'source '"$PWD"'/kicker.bash' >> ~/.bashrc   # bash completion
 ```
 
-With bash-completion@2, you can symlink the completion script instead of sourcing it from `.bashrc`.
+To start apps at login on macOS:
 
 ```console
-$ ln -s "$PWD/kicker.bash" "$(brew --prefix)/etc/bash_completion.d/kicker"
+$ kicker launchd install
 ```
 
-Completion reads app names from `kicker list`, so `kicker` must be on your `PATH`.
-
-### Start on login (macOS)
-
-```console
-$ kicker launchd install      # registers a LaunchAgent and runs kicker start right away
-$ kicker launchd uninstall
-```
-
-This runs `kicker start` once at login; it does not restart apps that crash.
-The `PATH` at install time is passed to launchd, so reinstall after changing your `PATH` or moving kicker.
-Output from the launchd run goes to `~/.local/state/kicker/logs/launchd.log`.
+The current `PATH` is saved into the LaunchAgent, so reinstall after changing it.
